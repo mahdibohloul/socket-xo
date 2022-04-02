@@ -6,26 +6,13 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
+#include <signal.h>
 
 #define FIRST_TURN 'X'
 #define SECOND_TURN 'O'
+#define TIMEOUT_SECONDS 60
+#define TIMEOUT_CODE -1
 
-int connect_server(int port) {
-    int fd;
-    struct sockaddr_in server_address;
-
-    fd = socket(AF_INET, SOCK_STREAM, 0);
-
-    server_address.sin_family = AF_INET;
-    server_address.sin_port = htons(port);
-    server_address.sin_addr.s_addr = inet_addr("127.0.0.1");
-
-    if (connect(fd, (struct sockaddr *) &server_address, sizeof(server_address)) < 0) { // checking for errors
-        printf("Error in connecting to server\n");
-    }
-
-    return fd;
-}
 
 char board[3][3] = {
         {'1', '2', '3'},
@@ -45,6 +32,128 @@ char current_player = FIRST_TURN;
 int port_game;
 struct sockaddr_in bc_addr;
 int server_fd;
+int game_fd;
+
+int connect_server(int port);
+
+void xo(int x, int y, char c);
+
+int is_game_done();
+
+char get_the_winner();
+
+int is_game_started(char *msg);
+
+int is_game_watchlist(char *msg);
+
+void extract_game_watchlist(char *msg);
+
+void print_game_watchlist();
+
+void connect_game_broadcast();
+
+void print_board();
+
+void send_game_result_to_server();
+
+void send_watching_game_to_server();
+
+void watch_game(int game_index);
+
+void timeout_handler(int signum);
+
+void register_timeout_signal();
+
+void start_game();
+
+void extract_game_turn_and_port(char *msg);
+
+int main(int argc, char const *argv[]) {
+    if (argc != 2) {
+        printf("Usage: %s <server_port>\n", argv[0]);
+        exit(1);
+    }
+    int server_port = atoi(argv[1]);
+    char buff[1024] = {0};
+
+    server_fd = connect_server(server_port);
+    int max_sd;
+    fd_set master_set, working_set;
+    FD_ZERO(&master_set);
+    max_sd = server_fd;
+    FD_SET(server_fd, &master_set);
+    FD_SET(STDIN_FILENO, &master_set);
+
+    while (1) {
+        working_set = master_set;
+        if (select(max_sd + 1, &working_set, NULL, NULL, NULL) < 0) {
+            printf("Error in select\n");
+            exit(1);
+        }
+        for (int i = max_sd; i >= 0; --i) {
+            if (FD_ISSET(i, &working_set)) {
+                if (i == 0) {
+                    read(0, buff, 1024);
+                    if (strcmp(buff, "exit\n") == 0) {
+                        close(server_fd);
+                        exit(0);
+                    }
+                    write(server_fd, buff, strlen(buff));
+                    memset(buff, 0, 1024);
+                } else if (i == server_fd) {
+                    read(server_fd, buff, 1024);
+                    if (is_game_started(buff) == 1) {
+                        extract_game_turn_and_port(buff);
+                        char msg[1024] = {0};
+                        sprintf(msg, "Game started, your turn: %c\n", turn);
+                        write(1, msg, strlen(msg));
+                        memset(buff, 0, 1024);
+                        start_game();
+                        continue;
+                    } else if (is_game_watchlist(buff) == 1) {
+                        extract_game_watchlist(buff);
+                        print_game_watchlist();
+                        memset(buff, 0, 1024);
+                        read(STDIN_FILENO, buff, 1024);
+                        int index;
+                        sscanf(buff, "%d", &index);
+                        while (games[index - 1].msg == NULL) {
+                            write(STDOUT_FILENO, "Invalid game number\n", 24);
+                            write(STDOUT_FILENO, "Select game to join: ", strlen("Select game to join: "));
+                            memset(buff, 0, 1024);
+                            read(STDIN_FILENO, buff, 1024);
+                            sscanf(buff, "%d", &index);
+                        }
+                        watch_game(index - 1);
+                        continue;
+                    }
+                    write(1, buff, strlen(buff));
+                    memset(buff, 0, 1024);
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+
+int connect_server(int port) {
+    int fd;
+    struct sockaddr_in server_address;
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    server_address.sin_family = AF_INET;
+    server_address.sin_port = htons(port);
+    server_address.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    if (connect(fd, (struct sockaddr *) &server_address, sizeof(server_address)) < 0) { // checking for errors
+        printf("Error in connecting to server\n");
+    }
+
+    return fd;
+}
 
 void xo(int x, int y, char c) {
     board[x - 1][y - 1] = c;
@@ -102,6 +211,7 @@ char get_the_winner() {
     }
     return ' ';
 }
+
 
 int is_game_started(char *msg) {
     char *copy = malloc(strlen(msg) + 1);
@@ -179,7 +289,7 @@ void print_game_watchlist() {
     write(STDOUT_FILENO, "Select game to join: ", strlen("Select game to join: "));
 }
 
-int connect_game_broadcast() {
+void connect_game_broadcast() {
     int sock, broadcast = 1, opt = 1;
     sock = socket(AF_INET, SOCK_DGRAM, 0);
     setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
@@ -191,7 +301,7 @@ int connect_game_broadcast() {
         printf("Error in binding\n");
         exit(1);
     }
-    return sock;
+    game_fd = sock;
 }
 
 void print_board() {
@@ -226,7 +336,7 @@ void send_watching_game_to_server() {
 void watch_game(int game_index) {
     port_game = games[game_index].port;
     send_watching_game_to_server();
-    int game_fd = connect_game_broadcast();
+    connect_game_broadcast();
     char buffer[1024];
     while (is_game_done() == 0) {
         print_board();
@@ -235,7 +345,11 @@ void watch_game(int game_index) {
         memset(buffer, 0, 1024);
         recvfrom(game_fd, buffer, 1024, 0, (struct sockaddr *) &bc_addr, sizeof(bc_addr));
         sscanf(buffer, "%d:%d:%c", &x, &y, &c);
-        xo(x, y, c);
+        if (x == TIMEOUT_CODE && y == TIMEOUT_CODE) {
+            write(STDOUT_FILENO, "The other player timed out\n", 27);
+        } else {
+            xo(x, y, c);
+        }
         memset(buffer, 0, 1024);
     }
     print_board();
@@ -249,43 +363,66 @@ void watch_game(int game_index) {
     }
 }
 
+void timeout_handler(int signum) {
+    write(STDOUT_FILENO, "Timeout!\n", 9);
+    char buffer[1024];
+    sprintf(buffer, "%d:%d:%c", TIMEOUT_CODE, TIMEOUT_CODE, turn);
+    sendto(game_fd, buffer, strlen(buffer), 0,
+           (struct sockaddr *) &bc_addr,
+           sizeof(bc_addr));
+}
+
+void register_timeout_signal() {
+    struct sigaction sa;
+    sa.sa_flags = SA_INTERRUPT;
+    sa.sa_handler = timeout_handler;
+    sigaction(SIGALRM, &sa, NULL);
+}
+
 void start_game() {
-    int game_fd = connect_game_broadcast();
+    register_timeout_signal();
+    connect_game_broadcast();
     char buffer[1024];
     while (is_game_done() == 0) {
         print_board();
         if (turn == current_player) {
             write(1, "Your turn: ", 10);
-            read(0, buffer, 1024);
-            int x, y;
-            sscanf(buffer, "%d %d", &x, &y);
-            if (x < 1 || x > 3 || y < 1 || y > 3) {
-                write(1, "Invalid move\n", 13);
-                continue;
+            alarm(TIMEOUT_SECONDS);
+            int read_st = read(0, buffer, 1024);
+            alarm(0);
+            if (read_st != -1) {
+                int x, y;
+                sscanf(buffer, "%d %d", &x, &y);
+                if (x < 1 || x > 3 || y < 1 || y > 3) {
+                    write(1, "Invalid move\n", 13);
+                    continue;
+                }
+                if (board[x - 1][y - 1] == FIRST_TURN || board[x - 1][y - 1] == SECOND_TURN) {
+                    write(1, "Invalid move\n", 13);
+                    continue;
+                }
+                xo(x, y, current_player);
+                memset(buffer, 0, 1024);
+                sprintf(buffer, "%d:%d:%c", x, y, turn);
+                sendto(game_fd, buffer, strlen(buffer), 0,
+                       (struct sockaddr *) &bc_addr,
+                       sizeof(bc_addr));
             }
-            if (board[x - 1][y - 1] == FIRST_TURN || board[x - 1][y - 1] == SECOND_TURN) {
-                write(1, "Invalid move\n", 13);
-                continue;
-            }
-            xo(x, y, current_player);
             current_player = (current_player == FIRST_TURN) ? SECOND_TURN : FIRST_TURN;
-            memset(buffer, 0, 1024);
-            sprintf(buffer, "%d:%d:%c", x, y, turn);
-            int a = sendto(game_fd, buffer, strlen(buffer), 0,
-                           (struct sockaddr *) &bc_addr,
-                           sizeof(bc_addr));
-            printf("%d bytes sent!\n", a);
         } else {
             char c;
             int x, y;
             memset(buffer, 0, 1024);
-            printf("Waiting for %c\n", current_player);
             recvfrom(game_fd, buffer, 1024, 0, (struct sockaddr *) &bc_addr, sizeof(bc_addr));
-            printf("INPUT: %s\n", buffer);
             sscanf(buffer, "%d:%d:%c", &x, &y, &c);
             if (c == turn)
                 continue;
-            xo(x, y, c);
+            if (x == TIMEOUT_CODE && y == TIMEOUT_CODE) {
+                write(STDOUT_FILENO, "The other player timed out\n", 27);
+                current_player = turn;
+            } else {
+                xo(x, y, c);
+            }
             current_player = turn;
             memset(buffer, 0, 1024);
         }
@@ -330,74 +467,4 @@ void extract_game_turn_and_port(char *msg) {
     token = strtok(NULL, " ");
     port_game = atoi(token);
     free(copy);
-}
-
-
-int main(int argc, char const *argv[]) {
-    if (argc != 2) {
-        printf("Usage: %s <server_port>\n", argv[0]);
-        exit(1);
-    }
-    int server_port = atoi(argv[1]);
-    char buff[1024] = {0};
-
-    server_fd = connect_server(server_port);
-    int max_sd;
-    fd_set master_set, working_set;
-    FD_ZERO(&master_set);
-    max_sd = server_fd;
-    FD_SET(server_fd, &master_set);
-    FD_SET(STDIN_FILENO, &master_set);
-
-    while (1) {
-        working_set = master_set;
-        if (select(max_sd + 1, &working_set, NULL, NULL, NULL) < 0) {
-            printf("Error in select\n");
-            exit(1);
-        }
-        for (int i = max_sd; i >= 0; --i) {
-            if (FD_ISSET(i, &working_set)) {
-                if (i == 0) {
-                    read(0, buff, 1024);
-                    if (strcmp(buff, "exit\n") == 0) {
-                        close(server_fd);
-                        exit(0);
-                    }
-                    write(server_fd, buff, strlen(buff));
-                    memset(buff, 0, 1024);
-                } else if (i == server_fd) {
-                    read(server_fd, buff, 1024);
-                    if (is_game_started(buff) == 1) {
-                        extract_game_turn_and_port(buff);
-                        char msg[1024] = {0};
-                        sprintf(msg, "Game started, your turn: %c\n", turn);
-                        write(1, msg, strlen(msg));
-                        memset(buff, 0, 1024);
-                        start_game();
-                        continue;
-                    } else if (is_game_watchlist(buff) == 1) {
-                        extract_game_watchlist(buff);
-                        print_game_watchlist();
-                        memset(buff, 0, 1024);
-                        read(STDIN_FILENO, buff, 1024);
-                        int index;
-                        sscanf(buff, "%d", &index);
-                        while (games[index - 1].msg == NULL) {
-                            write(STDOUT_FILENO, "Invalid game number\n", 24);
-                            write(STDOUT_FILENO, "Select game to join: ", strlen("Select game to join: "));
-                            memset(buff, 0, 1024);
-                            read(STDIN_FILENO, buff, 1024);
-                            sscanf(buff, "%d", &index);
-                        }
-                        watch_game(index - 1);
-                        continue;
-                    }
-                    write(1, buff, strlen(buff));
-                    memset(buff, 0, 1024);
-                }
-            }
-        }
-    }
-
-    return 0;
 }
