@@ -363,7 +363,7 @@ void remove_game(struct Game *game) {
 
 void track_game_result(struct Game *game, char winner) {
     char *file_path = "./result.txt";
-    int fd = open(file_path, O_RDWR | O_APPEND);
+    int fd = open(file_path, O_RDWR | O_APPEND | O_CREAT, 0666);
     char *msg = malloc(BUFFER_SIZE);
     sprintf(msg, "On port %d: %s vs %s\twinner: %c\n",
             game->port,

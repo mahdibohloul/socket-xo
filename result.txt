@@ -1,2 +1,0 @@
-On port 5000: mahdi vs erfan	winner: O
-On port 5000: ali vs mahya	winner: X
